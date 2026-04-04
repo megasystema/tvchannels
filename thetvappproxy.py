@@ -1,14 +1,12 @@
 #!/usr/bin/env python3
 """
-TheTVApp Local Proxy Server  (country + category organized + Jellyfin helpers)
+TheTVApp Local Proxy Server  (country organized + Xtream Codes API + Jellyfin helpers)
 ───────────────────────────────────────────────────────────────────────────────
-- Organizes channels as "Country | Category" groups
-- Assigns channel numbers (tvg-chno) by group for Jellyfin navigation
-- Serves playlist at http://localhost:8087/playlist.m3u
+- TVApp channels in groups: "1 tv app entretenimiento" / "2 tv app deportes"
+- Custom .m3u channels organized by country only
+- Xtream Codes API endpoint for IPTV Smarters / Perfect Player
+- Serves M3U playlist at /playlist.m3u
 - Auto-refreshes channel list every N minutes (default 30)
-- Merges custom .m3u file via --custom
-- Optional EPG via --epg
-- Optional Jellyfin auto-refresh via --jf-url / --jf-api-key / --jf-task-id
 
 Requirements:
     pip install requests beautifulsoup4 playwright flask
@@ -16,13 +14,10 @@ Requirements:
 
 Usage:
     python thetvapp_proxy.py --custom my_channels.m3u
-    python thetvapp_proxy.py --custom my_channels.m3u --epg "https://epg.pw/api/epg.xml?lang=en"
-    python thetvapp_proxy.py --custom my_channels.m3u --refresh 15
-    python thetvapp_proxy.py --custom my_channels.m3u --epg "https://epg.pw/api/epg.xml?lang=en" \
-        --jf-url "http://localhost:8096" --jf-api-key "111c5522c6414988b69ec57bfd822729" --jf-task-id "bea9b218c97bbf98c5dc1303bdb9a0ca"
+    python thetvapp_proxy.py --custom my_channels.m3u --epg "https://epg.pw/xmltv/epg.xml"
 """
 
-import asyncio, re, time, argparse, threading
+import asyncio, re, time, argparse, threading, json
 from pathlib import Path
 from datetime import datetime
 from collections import Counter
@@ -30,7 +25,7 @@ import os
 
 import requests
 from bs4 import BeautifulSoup
-from flask import Flask, Response, redirect
+from flask import Flask, Response, redirect, request
 
 HEADERS = {
     "User-Agent": (
@@ -41,9 +36,13 @@ HEADERS = {
     "Referer": "https://thetvapp.to/",
 }
 BASE_URL      = "https://thetvapp.to"
-PORT = int(os.environ.get("PORT", "8087"))
-CACHE_TTL     = 300           # token cache seconds
-REFRESH_EVERY = 30            # minutes
+PORT          = int(os.environ.get("PORT", "8087"))
+CACHE_TTL     = 300
+REFRESH_EVERY = 30
+
+# Xtream Codes credentials (set as env vars in Railway)
+XC_USER = os.environ.get("XC_USER", "admin")
+XC_PASS = os.environ.get("XC_PASS", "admin")
 
 app      = Flask(__name__)
 CHANNELS = []
@@ -54,14 +53,12 @@ LAST_REFRESH = {"time": None, "next": None}
 CUSTOM_FILE  = {"path": ""}
 EPG_URL      = {"url": ""}
 
-# Jellyfin auto-refresh config (optional)
 JELLYFIN = {
     "url": "",
     "api_key": "",
     "task_id": "",
 }
 
-# ── Country code → full name map ──────────────────────────────────────────────
 COUNTRY_MAP = {
     "us": "USA", "mx": "Mexico", "do": "Dominican Republic",
     "pr": "Puerto Rico", "co": "Colombia", "ve": "Venezuela",
@@ -76,50 +73,38 @@ COUNTRY_MAP = {
     "international": "International",
 }
 
-# ── Pluto TV channel name → category map ─────────────────────────────────────
 PLUTO_CATEGORY_MAP = {
-    # News
     "cnn": "News", "fox news": "News", "msnbc": "News", "bloomberg": "News",
     "nbc news": "News", "abc news": "News", "cbs news": "News",
     "sky news": "News", "euronews": "News", "france 24": "News",
     "al jazeera": "News", "telemundo news": "News", "univision news": "News",
-    # Sports
     "espn": "Sports", "nfl": "Sports", "nba": "Sports", "mlb": "Sports",
     "nhl": "Sports", "fox sports": "Sports", "beinsports": "Sports",
     "stadium": "Sports", "fight": "Sports", "wrestling": "Sports",
     "motor": "Sports", "racing": "Sports",
-    # Movies
     "movies": "Movies", "cinema": "Movies", "film": "Movies",
     "horror": "Movies", "comedy movies": "Movies", "action movies": "Movies",
     "thriller": "Movies", "drama movies": "Movies", "hallmark": "Movies",
     "lifetime": "Movies", "amc": "Movies", "tcm": "Movies",
-    # Kids
     "nickelodeon": "Kids", "cartoon": "Kids", "disney": "Kids",
     "nick jr": "Kids", "baby": "Kids", "kid": "Kids",
-    # Music
     "music": "Music", "mtv": "Music", "vh1": "Music", "bet": "Music",
-    # Documentary
     "discovery": "Documentary", "history": "Documentary", "nat geo": "Documentary",
     "science": "Documentary", "animal": "Documentary", "nature": "Documentary",
     "crime": "Documentary", "investigation": "Documentary",
-    # Entertainment
     "comedy": "Entertainment", "reality": "Entertainment", "bravo": "Entertainment",
     "e!": "Entertainment", "pop": "Entertainment", "tbs": "Entertainment",
     "tnt": "Entertainment", "usa network": "Entertainment",
-    # Spanish
-    "en español": "Spanish", "telenovela": "Spanish", "novela": "Spanish",
+    "en espanol": "Spanish", "telenovela": "Spanish", "novela": "Spanish",
     "univision": "Spanish", "telemundo": "Spanish", "galavision": "Spanish",
     "estrella": "Spanish", "unimas": "Spanish",
 }
 
 
-# ── Helpers: country & category ───────────────────────────────────────────────
-
 def normalize_category(raw: str, channel_name: str = "", tvg_id: str = "") -> str:
     raw_lower  = raw.strip().lower()
     name_lower = channel_name.strip().lower()
 
-    # Treat channels with Pluto markers or no category as Pluto TV
     is_pluto = "plutotv" in tvg_id.lower() or "pluto" in tvg_id.lower()
     if is_pluto or not raw_lower or raw_lower in ("pluto tv", "plutotv", "pluto"):
         for keyword, category in PLUTO_CATEGORY_MAP.items():
@@ -157,10 +142,6 @@ def extract_country_from_tvgid(tvg_id: str) -> str:
     return "International"
 
 
-def make_group(country: str, category: str) -> str:
-    return f"{country} | {category}"
-
-
 # ── 1. Scrape TheTVApp channel list ──────────────────────────────────────────
 
 def fetch_channels() -> list[dict]:
@@ -169,7 +150,6 @@ def fetch_channels() -> list[dict]:
     soup = BeautifulSoup(resp.text, "html.parser")
     entries, seen = [], set()
 
-    # Canales regulares de TheTVApp (entretenimiento / live TV)
     for a in soup.find_all("a", href=re.compile(r"^/tv/[^/]+-live-stream/")):
         href = a["href"]
         if href in seen:
@@ -182,14 +162,12 @@ def fetch_channels() -> list[dict]:
             "name": name,
             "url":  BASE_URL + href,
             "slug": slug,
-            # CAMBIO: grupo fijo "1 tv app entretenimiento"
             "group": "1 tv app entretenimiento",
             "logo": "",
             "tvg_id": "",
             "custom": False,
         })
 
-    # Eventos / deportes de TheTVApp
     for a in soup.find_all("a", href=re.compile(r"^/event/")):
         href = a["href"]
         if href in seen:
@@ -202,7 +180,6 @@ def fetch_channels() -> list[dict]:
             "name": name,
             "url":  BASE_URL + href,
             "slug": slug,
-            # CAMBIO: grupo fijo "2 tv app deportes"
             "group": "2 tv app deportes",
             "logo": "",
             "tvg_id": "",
@@ -213,33 +190,26 @@ def fetch_channels() -> list[dict]:
 
 
 def trigger_jellyfin_refresh():
-    """Trigger Jellyfin 'Refresh Guide' scheduled task if configured."""
-    jf_url    = JELLYFIN["url"].rstrip("/")
-    api_key   = JELLYFIN["api_key"]
-    task_id   = JELLYFIN["task_id"]
-
+    jf_url  = JELLYFIN["url"].rstrip("/")
+    api_key = JELLYFIN["api_key"]
+    task_id = JELLYFIN["task_id"]
     if not (jf_url and api_key and task_id):
         return
-
     try:
         endpoint = f"{jf_url}/ScheduledTasks/{task_id}/Trigger"
-        resp = requests.post(
-            endpoint,
-            headers={"X-Emby-Token": api_key},
-            timeout=10,
-        )
-        if resp.status_code == 204 or resp.status_code == 200:
+        resp = requests.post(endpoint, headers={"X-Emby-Token": api_key}, timeout=10)
+        if resp.status_code in (200, 204):
             print(f"[JF] Triggered Jellyfin guide refresh ({endpoint})")
         else:
-            print(f"[JF] Refresh request returned {resp.status_code}: {resp.text[:200]}")
+            print(f"[JF] Refresh returned {resp.status_code}: {resp.text[:200]}")
     except Exception as e:
-        print(f"[JF] Failed to trigger Jellyfin refresh: {e}")
+        print(f"[JF] Failed: {e}")
 
 
 def refresh_channels():
     global CHANNELS
     try:
-        print(f"\n[↻] Refreshing at {datetime.now().strftime('%H:%M:%S')} ...")
+        print(f"\n[refresh] Refreshing at {datetime.now().strftime('%H:%M:%S')} ...")
         new_channels = fetch_channels()
         new_slugs = {ch["slug"] for ch in new_channels}
         for s in [s for s in list(TOKEN_CACHE.keys()) if s not in new_slugs]:
@@ -248,8 +218,6 @@ def refresh_channels():
         LAST_REFRESH["time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         LAST_REFRESH["next"] = f"in {REFRESH_EVERY} min"
         print(f"[+] {len(CHANNELS)} TheTVApp channels. Next refresh {LAST_REFRESH['next']}.")
-
-        # After proxy refreshes, ask Jellyfin to refresh guide (and channels)
         trigger_jellyfin_refresh()
     except Exception as e:
         print(f"[!] Refresh failed: {e}")
@@ -263,7 +231,7 @@ def start_refresh_timer():
     threading.Thread(target=loop, daemon=True).start()
 
 
-# ── 2. Parse custom .m3u (handles #EXTVLCOPT, country + Pluto TV detection) ──
+# ── 2. Parse custom .m3u ─────────────────────────────────────────────────────
 
 def parse_custom_m3u(filepath: str) -> list[dict]:
     path = Path(filepath)
@@ -292,8 +260,7 @@ def parse_custom_m3u(filepath: str) -> list[dict]:
 
             country  = extract_country_from_tvgid(tvg_id) if tvg_id else "International"
             category = normalize_category(raw_group, channel_name=name, tvg_id=tvg_id)
-            # CAMBIO: agrupar solo por país (sin categoría)
-            group    = country
+            group    = country  # Solo por pais
 
             i += 1
             stream_url = None
@@ -312,11 +279,8 @@ def parse_custom_m3u(filepath: str) -> list[dict]:
 
             if stream_url:
                 slug = re.sub(
-                    r"[^a-z0-9]+",
-                    "-",
+                    r"[^a-z0-9]+", "-",
                     name.lower()
-                        .replace("ñ", "n").replace("é", "e").replace("á", "a")
-                        .replace("ó", "o").replace("ú", "u").replace("í", "i"),
                 ).strip("-")
                 entries.append({
                     "name": name,
@@ -331,7 +295,7 @@ def parse_custom_m3u(filepath: str) -> list[dict]:
         i += 1
 
     groups = Counter(e["group"] for e in entries)
-    print("\n[Groups detected in custom playlist]")
+    print("\n[Custom playlist groups (by country)]")
     for grp, count in sorted(groups.items()):
         print(f"  {grp}: {count} channels")
 
@@ -377,7 +341,22 @@ def get_stream_url(page_url: str, slug: str) -> str | None:
     return url
 
 
-# ── 4. HTML Template (unchanged behaviour) ────────────────────────────────────
+# ── Helper: ordered channel list ─────────────────────────────────────────────
+
+def get_all_channels_sorted():
+    return sorted(CHANNELS + CUSTOM, key=lambda x: (x["group"], x["name"]))
+
+
+def get_group_order():
+    all_ch = get_all_channels_sorted()
+    seen = []
+    for ch in all_ch:
+        if ch["group"] not in seen:
+            seen.append(ch["group"])
+    return seen
+
+
+# ── 4. HTML Template ──────────────────────────────────────────────────────────
 
 HTML_TEMPLATE = """<!DOCTYPE html>
 <html>
@@ -390,14 +369,15 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     body{font-family:sans-serif;background:#0f0f0f;color:#eee;padding:2rem}
     h1{color:#00d4ff;margin-bottom:1rem}
     .info{background:#1a1a2e;padding:1rem 1.5rem;border-radius:8px;margin-bottom:1rem;border:1px solid #0e4d6e}
-    .info code{color:#00d4ff;font-size:1rem}
+    .info code{color:#00d4ff;font-size:.9rem}
+    .xc-box{background:#1a2e1a;padding:1rem 1.5rem;border-radius:8px;margin-bottom:1rem;border:1px solid #0e6e2e}
+    .xc-box h3{color:#00ff88;margin-bottom:.5rem;font-size:.95rem}
+    .xc-box code{color:#00ff88;font-size:.85rem;display:block;margin:.2rem 0}
     .meta{display:flex;gap:.75rem;flex-wrap:wrap;margin-bottom:1.5rem;font-size:.84rem;color:#aaa}
     .meta span{background:#1a1a2e;padding:.4rem .9rem;border-radius:6px}
     .meta span b{color:#eee}
     .meta a{background:#0e4d6e;color:#7dd3fc;padding:.4rem .9rem;border-radius:6px;text-decoration:none;font-weight:bold}
     .meta a:hover{background:#1a6e8e}
-    hr{display:block;height:1px;border:0;border-top:1px solid #1a1a2e;margin:1em 0;padding:0}
-    .error-details{margin-top:0.5em;max-width:600px}
     .filters{display:flex;gap:.75rem;flex-wrap:wrap;margin-bottom:1rem}
     .filters input,.filters select{background:#1a1a2e;border:1px solid #0e4d6e;color:#eee;
       padding:.45rem .9rem;border-radius:6px;font-size:.9rem}
@@ -416,8 +396,14 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 <body>
   <h1>&#128250; TheTVApp Local Proxy</h1>
   <div class="info">
-    Playlist URL for your IPTV app (Jellyfin / TiviMate / Kodi):
-    de>http://localhost:PORT_PLACEHOLDER/playlist.m3u</code>
+    <b>M3U Playlist URL:</b><br>
+    <code>M3U_URL_PLACEHOLDER</code>
+  </div>
+  <div class="xc-box">
+    <h3>&#127381; Xtream Codes (IPTV Smarters / Perfect Player)</h3>
+    <code>Host: XC_HOST_PLACEHOLDER</code>
+    <code>Usuario: XC_USER_PLACEHOLDER</code>
+    <code>Contrasena: XC_PASS_PLACEHOLDER</code>
   </div>
   <div class="meta">
     <span>Total: <b>COUNT_PLACEHOLDER</b></span>
@@ -429,18 +415,14 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   </div>
   <div class="filters">
     <input type="text" id="search" placeholder="&#128269; Search channel name..." oninput="applyFilters()">
-    <select id="countryFilter" onchange="applyFilters()">
-      <option value="">All Countries</option>
-      COUNTRY_OPTIONS
-    </select>
-    <select id="catFilter" onchange="applyFilters()">
-      <option value="">All Categories</option>
-      CAT_OPTIONS
+    <select id="groupFilter" onchange="applyFilters()">
+      <option value="">All Groups</option>
+      GROUP_OPTIONS
     </select>
   </div>
   <table id="tbl">
     <thead>
-      <tr><th>#</th><th>Logo</th><th>Channel</th><th>Group</th><th>Play</th><th>URL</th></tr>
+      <tr><th>#</th><th>Logo</th><th>Channel</th><th>Group</th><th>Play</th></tr>
     </thead>
     <tbody>
 ROWS_PLACEHOLDER
@@ -449,15 +431,11 @@ ROWS_PLACEHOLDER
   <script>
     function applyFilters(){
       var q  = document.getElementById('search').value.toLowerCase();
-      var co = document.getElementById('countryFilter').value.toLowerCase();
-      var ca = document.getElementById('catFilter').value.toLowerCase();
+      var gr = document.getElementById('groupFilter').value.toLowerCase();
       document.querySelectorAll('#tbl tbody tr').forEach(function(r){
-        var txt  = r.textContent.toLowerCase();
-        var grp  = (r.dataset.group||'').toLowerCase();
-        var show = (!q || txt.includes(q))
-                && (!co || grp.startsWith(co))
-                && (!ca || grp.includes('| ' + ca.toLowerCase()));
-        r.style.display = show ? '' : 'none';
+        var txt = r.textContent.toLowerCase();
+        var grp = (r.dataset.group||'').toLowerCase();
+        r.style.display = (!q || txt.includes(q)) && (!gr || grp === gr) ? '' : 'none';
       });
     }
   </script>
@@ -469,53 +447,48 @@ ROWS_PLACEHOLDER
 
 @app.route("/")
 def index():
-    all_channels = CHANNELS + CUSTOM
+    all_channels = get_all_channels_sorted()
+    base         = request.host_url.rstrip("/")
 
-    countries  = sorted(set(ch["group"].split(" | ")[0] for ch in all_channels))
-    categories = sorted(set(ch["group"].split(" | ")[1] for ch in all_channels if " | " in ch["group"]))
-
-    country_opts = "\n".join(f'<option value="{c}">{c}</option>' for c in countries)
-    cat_opts     = "\n".join(f'<option value="{c}">{c}</option>' for c in categories)
-
-    sorted_channels = sorted(all_channels, key=lambda x: (x["group"], x["name"]))
+    groups     = list(dict.fromkeys(ch["group"] for ch in all_channels))
+    group_opts = "\n".join(f'<option value="{g}">{g}</option>' for g in groups)
 
     rows = ""
-    for i, ch in enumerate(sorted_channels, 1):
-        stream_link = ch["stream_url"] if ch.get("custom") else f"http://localhost:{PORT}/stream/{ch['slug']}"
+    for i, ch in enumerate(all_channels, 1):
+        stream_link = ch["stream_url"] if ch.get("custom") else f"{base}/stream/{ch['slug']}"
         logo        = ch.get("logo", "")
         logo_html   = f'<img class="logo" src="{logo}" alt="" loading="lazy">' if logo else ""
         group       = ch.get("group", "")
-
         rows += (
             f'<tr data-group="{group}">'
-            f"<td>{i}</td>"
-            f"<td>{logo_html}</td>"
-            f"<td>{ch['name']}</td>"
+            f"<td>{i}</td><td>{logo_html}</td><td>{ch['name']}</td>"
             f"<td><span class='grp'>{group}</span></td>"
             f"<td><a class='play' href='{stream_link}' target='_blank'>&#9654; Play</a></td>"
-            f"<td>de>{stream_link}</code></td>"
             f"</tr>\n"
         )
 
     html = (
         HTML_TEMPLATE
-        .replace("PORT_PLACEHOLDER",  str(PORT))
-        .replace("COUNT_PLACEHOLDER", str(len(all_channels)))
-        .replace("TVAPP_COUNT",       str(len(CHANNELS)))
-        .replace("CUSTOM_COUNT",      str(len(CUSTOM)))
-        .replace("LAST_REFRESH",      LAST_REFRESH["time"] or "N/A")
-        .replace("NEXT_REFRESH",      LAST_REFRESH["next"] or "N/A")
-        .replace("REFRESH_SEC",       str(REFRESH_EVERY * 60))
-        .replace("COUNTRY_OPTIONS",   country_opts)
-        .replace("CAT_OPTIONS",       cat_opts)
-        .replace("ROWS_PLACEHOLDER",  rows)
+        .replace("M3U_URL_PLACEHOLDER",  f"{base}/playlist.m3u")
+        .replace("XC_HOST_PLACEHOLDER",  base)
+        .replace("XC_USER_PLACEHOLDER",  XC_USER)
+        .replace("XC_PASS_PLACEHOLDER",  XC_PASS)
+        .replace("COUNT_PLACEHOLDER",    str(len(all_channels)))
+        .replace("TVAPP_COUNT",          str(len(CHANNELS)))
+        .replace("CUSTOM_COUNT",         str(len(CUSTOM)))
+        .replace("LAST_REFRESH",         LAST_REFRESH["time"] or "N/A")
+        .replace("NEXT_REFRESH",         LAST_REFRESH["next"] or "N/A")
+        .replace("REFRESH_SEC",          str(REFRESH_EVERY * 60))
+        .replace("GROUP_OPTIONS",        group_opts)
+        .replace("ROWS_PLACEHOLDER",     rows)
     )
     return Response(html, mimetype="text/html")
 
 
 @app.route("/playlist.m3u")
 def playlist():
-    all_channels = sorted(CHANNELS + CUSTOM, key=lambda x: (x["group"], x["name"]))
+    all_channels = get_all_channels_sorted()
+    base         = request.host_url.rstrip("/")
     epg          = EPG_URL["url"]
 
     header = "#EXTM3U"
@@ -523,30 +496,18 @@ def playlist():
         header += f' url-tvg="{epg}" tvg-shift="-5"'
     lines = [header]
 
-    # Assign channel numbers per group: each group gets its own 100-block
-    group_order = []
-    for ch in all_channels:
-        grp = ch.get("group", "General")
-        if grp not in group_order:
-            group_order.append(grp)
-
-    group_base = {grp: (i + 1) * 100 for i, grp in enumerate(group_order)}
-    counters   = {grp: 0 for grp in group_order}
+    group_order = get_group_order()
+    group_base  = {grp: (i + 1) * 100 for i, grp in enumerate(group_order)}
+    counters    = {grp: 0 for grp in group_order}
 
     for ch in all_channels:
-        group     = ch.get("group", "General")
-        base      = group_base[group]
+        group = ch.get("group", "General")
         counters[group] += 1
-        chno      = base + counters[group]
-
-        stream_url = ch["stream_url"] if ch.get("custom") else f"http://localhost:{PORT}/stream/{ch['slug']}"
-        tvg_id     = ch.get("tvg_id", "")
-        logo       = ch.get("logo", "")
-        name       = ch["name"]
-
+        chno       = group_base[group] + counters[group]
+        stream_url = ch["stream_url"] if ch.get("custom") else f"{base}/stream/{ch['slug']}"
         lines.append(
-            f'#EXTINF:-1 tvg-id="{tvg_id}" tvg-name="{name}" '
-            f'tvg-logo="{logo}" group-title="{group}" tvg-chno="{chno}",{name}'
+            f'#EXTINF:-1 tvg-id="{ch.get("tvg_id","")}" tvg-name="{ch["name"]}" '
+            f'tvg-logo="{ch.get("logo","")}" group-title="{group}" tvg-chno="{chno}",{ch["name"]}'
         )
         lines.append(stream_url)
 
@@ -557,8 +518,120 @@ def playlist():
     )
 
 
+# ── 6. Xtream Codes API ───────────────────────────────────────────────────────
+
+def xc_auth(username: str, password: str) -> bool:
+    return username == XC_USER and password == XC_PASS
+
+
+def xc_user_info(username: str):
+    return {
+        "username": username,
+        "password": XC_PASS,
+        "message": "",
+        "auth": 1,
+        "status": "Active",
+        "exp_date": "9999999999",
+        "is_trial": "0",
+        "active_cons": "1",
+        "created_at": "0",
+        "max_connections": "10",
+        "allowed_output_formats": ["m3u8", "ts", "rtmp"]
+    }
+
+
+def xc_server_info():
+    return {
+        "url": os.environ.get("RAILWAY_STATIC_URL", "localhost"),
+        "port": "80",
+        "https_port": "443",
+        "server_protocol": "https",
+        "rtmp_port": "1935",
+        "timezone": "America/New_York",
+        "timestamp_now": int(time.time()),
+        "time_now": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    }
+
+
+@app.route("/player_api.php")
+def player_api():
+    username = request.args.get("username", "")
+    password = request.args.get("password", "")
+    action   = request.args.get("action", "")
+
+    if not xc_auth(username, password):
+        return Response(json.dumps({"user_info": {"auth": 0}}), mimetype="application/json")
+
+    if not action:
+        data = {
+            "user_info":   xc_user_info(username),
+            "server_info": xc_server_info()
+        }
+        return Response(json.dumps(data), mimetype="application/json")
+
+    if action == "get_live_categories":
+        groups = get_group_order()
+        cats = [
+            {"category_id": str(i + 1), "category_name": g, "parent_id": 0}
+            for i, g in enumerate(groups)
+        ]
+        return Response(json.dumps(cats), mimetype="application/json")
+
+    if action == "get_live_streams":
+        base   = request.host_url.rstrip("/")
+        all_ch = get_all_channels_sorted()
+        groups = get_group_order()
+        cat_map = {g: str(i + 1) for i, g in enumerate(groups)}
+
+        streams = []
+        for i, ch in enumerate(all_ch, 1):
+            stream_url = ch["stream_url"] if ch.get("custom") else f"{base}/stream/{ch['slug']}"
+            streams.append({
+                "num":                  i,
+                "name":                 ch["name"],
+                "stream_type":          "live",
+                "stream_id":            i,
+                "stream_icon":          ch.get("logo", ""),
+                "epg_channel_id":       ch.get("tvg_id", ""),
+                "added":                str(int(time.time())),
+                "category_id":          cat_map.get(ch["group"], "1"),
+                "custom_sid":           "",
+                "tv_archive":           0,
+                "direct_source":        stream_url,
+                "tv_archive_duration":  0
+            })
+        return Response(json.dumps(streams), mimetype="application/json")
+
+    if action in ("get_short_epg", "get_simple_data_table"):
+        return Response(json.dumps({"epg_listings": []}), mimetype="application/json")
+
+    return Response(json.dumps([]), mimetype="application/json")
+
+
+# XC-style stream URL: /<user>/<pass>/<stream_id>
+@app.route("/<string:username>/<string:password>/<int:stream_id>")
+def xc_stream(username: str, password: str, stream_id: int):
+    if not xc_auth(username, password):
+        return "Unauthorized", 401
+
+    all_ch = get_all_channels_sorted()
+    if stream_id < 1 or stream_id > len(all_ch):
+        return "Not found", 404
+
+    ch = all_ch[stream_id - 1]
+    if ch.get("custom"):
+        return redirect(ch["stream_url"])
+
+    print(f"[XC] Token request: {ch['name']}")
+    url = get_stream_url(ch["url"], ch["slug"])
+    if not url:
+        return "Stream unavailable", 503
+    return redirect(url)
+
+
+# Regular stream route
 @app.route("/stream/<slug>")
-def stream(slug):
+def stream(slug: str):
     ch = next((c for c in CHANNELS if c["slug"] == slug), None)
     if not ch:
         return "Channel not found", 404
@@ -578,22 +651,36 @@ def manual_refresh():
     return redirect("/")
 
 
-# ── 6. Entry point ────────────────────────────────────────────────────────────
+@app.route("/debug")
+def debug():
+    info = {
+        "channels_count": len(CHANNELS),
+        "custom_count":   len(CUSTOM),
+        "sample_channels": [
+            {"name": c["name"], "slug": c["slug"], "group": c["group"]}
+            for c in (CHANNELS + CUSTOM)[:10]
+        ],
+        "last_refresh": LAST_REFRESH,
+        "xc_user": XC_USER,
+    }
+    return Response(json.dumps(info, indent=2), mimetype="application/json")
+
+
+# ── 7. Entry point ────────────────────────────────────────────────────────────
 
 def main():
-    ap = argparse.ArgumentParser(description="TheTVApp Local Proxy Server")
-    ap.add_argument("--port",    type=int, default=8087, help="Proxy port (default 8087)")
-    ap.add_argument("--custom",  default="", help="Path to custom .m3u file")
-    ap.add_argument("--refresh", type=int, default=30, help="Channel list refresh interval in minutes")
-    ap.add_argument("--epg",     default="", help="EPG XMLTV URL")
-    ap.add_argument("--jf-url",      default="", help="Jellyfin base URL (e.g. http://localhost:8096)")
-    ap.add_argument("--jf-api-key",  default="", help="Jellyfin API key with admin rights")
-    ap.add_argument("--jf-task-id",  default="", help="Jellyfin 'Refresh Guide' scheduled task ID")
+    ap = argparse.ArgumentParser(description="TheTVApp Local Proxy + XC Server")
+    ap.add_argument("--port",       type=int, default=8087)
+    ap.add_argument("--custom",     default="")
+    ap.add_argument("--refresh",    type=int, default=30)
+    ap.add_argument("--epg",        default="")
+    ap.add_argument("--jf-url",     default="")
+    ap.add_argument("--jf-api-key", default="")
+    ap.add_argument("--jf-task-id", default="")
     args = ap.parse_args()
 
     CUSTOM_FILE["path"] = args.custom
     EPG_URL["url"]      = args.epg
-
     JELLYFIN["url"]     = args.jf_url
     JELLYFIN["api_key"] = args.jf_api_key
     JELLYFIN["task_id"] = args.jf_task_id
@@ -602,11 +689,11 @@ def main():
     PORT          = args.port
     REFRESH_EVERY = args.refresh
 
-    print("[*] Fetching channel list from thetvapp.to ...")
+    print("[*] Fetching TVApp channel list ...")
     CHANNELS = fetch_channels()
     LAST_REFRESH["time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     LAST_REFRESH["next"] = f"in {REFRESH_EVERY} min"
-    print(f"[+] {len(CHANNELS)} TheTVApp channels loaded.")
+    print(f"[+] {len(CHANNELS)} TVApp channels loaded.")
 
     if args.custom:
         CUSTOM = parse_custom_m3u(args.custom)
@@ -621,7 +708,10 @@ def main():
     print(f"\n[OK] Total channels : {len(CHANNELS) + len(CUSTOM)}")
     print(f"[OK] Auto-refresh   : every {REFRESH_EVERY} minutes")
     print(f"[OK] Browser UI     : http://localhost:{PORT}/")
-    print(f"[OK] Playlist URL   : http://localhost:{PORT}/playlist.m3u\n")
+    print(f"[OK] Playlist URL   : http://localhost:{PORT}/playlist.m3u")
+    print(f"[OK] XC API         : http://localhost:{PORT}/player_api.php")
+    print(f"[OK] XC User        : {XC_USER}")
+    print(f"[OK] XC Pass        : {XC_PASS}\n")
 
     start_refresh_timer()
     app.run(host="0.0.0.0", port=PORT, debug=False)
