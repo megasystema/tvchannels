@@ -305,55 +305,75 @@ def parse_custom_m3u(filepath: str) -> list[dict]:
 # ── 3. Playwright token fetch ─────────────────────────────────────────────────
 
 async def _get_stream_url(page_url: str) -> str | None:
-    from playwright.async_api import async_playwright
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        ctx  = await browser.new_context(user_agent=HEADERS["User-Agent"])
-        page = await ctx.new_page()
-        found: list[str] = []
+    """
+    Intenta obtener el stream m3u8 sin Playwright:
+    1. Busca en el HTML el token/url directo
+    2. Fallback a Playwright solo si es necesario
+    """
+    try:
+        resp = requests.get(page_url, headers=HEADERS, timeout=15)
+        html = resp.text
 
-        async def intercept(req):
-            if ".m3u8" in req.url and not found:
-                found.append(req.url)
+        # Busca URLs m3u8 directas en el HTML/JS
+        patterns = [
+            r'(https?://[^\s"\']+\.m3u8[^\s"\']*)',
+            r'file:\s*["\']([^"\']+\.m3u8[^"\']*)["\']',
+            r'source:\s*["\']([^"\']+\.m3u8[^"\']*)["\']',
+            r'src:\s*["\']([^"\']+\.m3u8[^"\']*)["\']',
+            r'"url"\s*:\s*"([^"]+\.m3u8[^"]*)"',
+            r"'url'\s*:\s*'([^']+\.m3u8[^']*)'",
+        ]
+        for pattern in patterns:
+            matches = re.findall(pattern, html)
+            if matches:
+                print(f"[✓] Found m3u8 via HTML scrape: {matches[0][:80]}...")
+                return matches[0]
 
-        page.on("request", intercept)
+        # Busca en scripts inline por tokens
+        token_match = re.search(r'token[=:][\s"\']*([A-Za-z0-9_\-]{20,})', html)
+        expires_match = re.search(r'expires[=:][\s"\']*(\d{10,})', html)
+        stream_match = re.search(r'(https?://[^\s"\']+/hls/[^\s"\']+)', html)
 
-        try:
-            await page.goto(page_url, wait_until="networkidle", timeout=20_000)
-            deadline = time.time() + 10
-            while not found and time.time() < deadline:
-                await asyncio.sleep(0.3)
-        except Exception:
-            pass
-        finally:
-            await browser.close()
+        if stream_match:
+            base_stream = stream_match.group(1)
+            if token_match and expires_match and "token=" not in base_stream:
+                return f"{base_stream}?token={token_match.group(1)}&expires={expires_match.group(1)}"
+            return base_stream
 
-    return found[0] if found else None
+    except Exception as e:
+        print(f"[!] HTML scrape failed: {e}")
 
+    # Fallback a Playwright si está disponible
+    try:
+        from playwright.async_api import async_playwright
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            ctx  = await browser.new_context(user_agent=HEADERS["User-Agent"])
+            page = await ctx.new_page()
+            found: list[str] = []
 
-def get_stream_url(page_url: str, slug: str) -> str | None:
-    cached_url, cached_at = TOKEN_CACHE.get(slug, (None, 0))
-    if cached_url and (time.time() - cached_at) < CACHE_TTL:
-        return cached_url
-    url = asyncio.run(_get_stream_url(page_url))
-    if url:
-        TOKEN_CACHE[slug] = (url, time.time())
-    return url
+            async def intercept(req):
+                if ".m3u8" in req.url and not found:
+                    found.append(req.url)
 
+            page.on("request", intercept)
+            try:
+                await page.goto(page_url, wait_until="networkidle", timeout=20_000)
+                deadline = time.time() + 10
+                while not found and time.time() < deadline:
+                    await asyncio.sleep(0.3)
+            except Exception:
+                pass
+            finally:
+                await browser.close()
 
-# ── Helper: ordered channel list ─────────────────────────────────────────────
+        if found:
+            print(f"[✓] Found m3u8 via Playwright: {found[0][:80]}...")
+            return found[0]
+    except Exception as e:
+        print(f"[!] Playwright fallback failed: {e}")
 
-def get_all_channels_sorted():
-    return sorted(CHANNELS + CUSTOM, key=lambda x: (x["group"], x["name"]))
-
-
-def get_group_order():
-    all_ch = get_all_channels_sorted()
-    seen = []
-    for ch in all_ch:
-        if ch["group"] not in seen:
-            seen.append(ch["group"])
-    return seen
+    return None
 
 
 # ── 4. HTML Template ──────────────────────────────────────────────────────────
