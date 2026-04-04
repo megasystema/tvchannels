@@ -1,36 +1,37 @@
 #!/usr/bin/env python3
 """
-TheTVApp Local Proxy Server  (country + category organized + Jellyfin helpers)
-───────────────────────────────────────────────────────────────────────────────
-- Organizes channels as "Country | Category" groups
-- Assigns channel numbers (tvg-chno) by group for Jellyfin navigation
-- Serves playlist at http://localhost:8087/playlist.m3u
-- Auto-refreshes channel list every N minutes (default 30)
-- Merges custom .m3u file via --custom
-- Optional EPG via --epg
-- Optional Jellyfin auto-refresh via --jf-url / --jf-api-key / --jf-task-id
+TheTVApp Local/Remote Proxy Server
+──────────────────────────────────
+- Une canales de TheTVApp + tu playlist custom (my_channels.m3u)
+- Agrupa TheTVApp como:
+    1 TVApp Entretenimiento
+    1 TVApp Deportes
+- Agrupa canales custom solo por país:
+    Dominicana, Colombia, Puerto Rico, USA, etc.
+- Expone playlist M3U en: /playlist.m3u
 
-Requirements:
-    pip install requests beautifulsoup4 playwright flask
-    playwright install chromium
+Uso típico (local o Railway):
 
-Usage:
-    python thetvapp_proxy.py --custom my_channels.m3u
-    python thetvapp_proxy.py --custom my_channels.m3u --epg "https://epg.pw/api/epg.xml?lang=en"
-    python thetvapp_proxy.py --custom my_channels.m3u --refresh 15
-    python thetvapp_proxy.py --custom my_channels.m3u --epg "https://epg.pw/api/epg.xml?lang=en" \
-        --jf-url "http://localhost:8096" --jf-api-key "111c5522c6414988b69ec57bfd822729" --jf-task-id "bea9b218c97bbf98c5dc1303bdb9a0ca"
+    python thetvapp_proxy.py --custom my_channels.m3u \
+        --epg "https://epg.pw/api/epg.xml?lang=en"
 """
 
-import asyncio, re, time, argparse, threading
-from pathlib import Path
-from datetime import datetime
-from collections import Counter
 import os
+import re
+import time
+import threading
+import asyncio
+from datetime import datetime
+from pathlib import Path
+from collections import Counter
 
 import requests
 from bs4 import BeautifulSoup
 from flask import Flask, Response, redirect
+
+# ───────────────────────────────────────────────────────────────────────────────
+# Configuración básica
+# ───────────────────────────────────────────────────────────────────────────────
 
 HEADERS = {
     "User-Agent": (
@@ -40,135 +41,88 @@ HEADERS = {
     ),
     "Referer": "https://thetvapp.to/",
 }
+
 BASE_URL      = "https://thetvapp.to"
-PORT = int(os.environ.get("PORT", "8087"))
-CACHE_TTL     = 300           # token cache seconds
-REFRESH_EVERY = 30            # minutes
+PORT          = int(os.environ.get("PORT", "8087"))  # Compatible con Railway
+CACHE_TTL     = 300      # 5 minutos por token de stream
+REFRESH_EVERY = 30       # minutos para refrescar la lista de canales TVApp
 
 app      = Flask(__name__)
-CHANNELS = []
-CUSTOM   = []
+CHANNELS = []            # Canales de TheTVApp
+CUSTOM   = []            # Canales de my_channels.m3u
 TOKEN_CACHE: dict[str, tuple[str, float]] = {}
 
 LAST_REFRESH = {"time": None, "next": None}
 CUSTOM_FILE  = {"path": ""}
 EPG_URL      = {"url": ""}
 
-# Jellyfin auto-refresh config (optional)
-JELLYFIN = {
-    "url": "",
-    "api_key": "",
-    "task_id": "",
-}
+# ───────────────────────────────────────────────────────────────────────────────
+# Mapa de países (tvg-id -> nombre de país en español)
+# ───────────────────────────────────────────────────────────────────────────────
 
-# ── Country code → full name map ──────────────────────────────────────────────
 COUNTRY_MAP = {
-    "us": "USA", "mx": "Mexico", "do": "Dominican Republic",
-    "pr": "Puerto Rico", "co": "Colombia", "ve": "Venezuela",
-    "ar": "Argentina", "cl": "Chile", "pe": "Peru", "ec": "Ecuador",
-    "bo": "Bolivia", "py": "Paraguay", "uy": "Uruguay", "gt": "Guatemala",
-    "hn": "Honduras", "sv": "El Salvador", "ni": "Nicaragua", "cr": "Costa Rica",
-    "pa": "Panama", "cu": "Cuba", "ht": "Haiti", "br": "Brazil",
-    "es": "Spain", "fr": "France", "it": "Italy", "de": "Germany",
-    "gb": "United Kingdom", "pt": "Portugal", "nl": "Netherlands",
-    "za": "South Africa", "ng": "Nigeria", "gh": "Ghana",
-    "au": "Australia", "ca": "Canada", "at": "Austria",
-    "international": "International",
+    "do": "Dominicana",
+    "pr": "Puerto Rico",
+    "co": "Colombia",
+    "ve": "Venezuela",
+    "mx": "México",
+    "ar": "Argentina",
+    "cl": "Chile",
+    "pe": "Perú",
+    "ec": "Ecuador",
+    "bo": "Bolivia",
+    "py": "Paraguay",
+    "uy": "Uruguay",
+    "gt": "Guatemala",
+    "hn": "Honduras",
+    "sv": "El Salvador",
+    "ni": "Nicaragua",
+    "cr": "Costa Rica",
+    "pa": "Panamá",
+    "cu": "Cuba",
+    "ht": "Haití",
+    "br": "Brasil",
+    "us": "USA",
+    "ca": "Canadá",
+    "es": "España",
+    "pt": "Portugal",
+    "fr": "Francia",
+    "it": "Italia",
+    "de": "Alemania",
+    "gb": "Reino Unido",
+    "nl": "Países Bajos",
+    "za": "Sudáfrica",
+    "ng": "Nigeria",
+    "gh": "Ghana",
+    "au": "Australia",
+    "at": "Austria",
 }
-
-# ── Pluto TV channel name → category map ─────────────────────────────────────
-PLUTO_CATEGORY_MAP = {
-    # News
-    "cnn": "News", "fox news": "News", "msnbc": "News", "bloomberg": "News",
-    "nbc news": "News", "abc news": "News", "cbs news": "News",
-    "sky news": "News", "euronews": "News", "france 24": "News",
-    "al jazeera": "News", "telemundo news": "News", "univision news": "News",
-    # Sports
-    "espn": "Sports", "nfl": "Sports", "nba": "Sports", "mlb": "Sports",
-    "nhl": "Sports", "fox sports": "Sports", "beinsports": "Sports",
-    "stadium": "Sports", "fight": "Sports", "wrestling": "Sports",
-    "motor": "Sports", "racing": "Sports",
-    # Movies
-    "movies": "Movies", "cinema": "Movies", "film": "Movies",
-    "horror": "Movies", "comedy movies": "Movies", "action movies": "Movies",
-    "thriller": "Movies", "drama movies": "Movies", "hallmark": "Movies",
-    "lifetime": "Movies", "amc": "Movies", "tcm": "Movies",
-    # Kids
-    "nickelodeon": "Kids", "cartoon": "Kids", "disney": "Kids",
-    "nick jr": "Kids", "baby": "Kids", "kid": "Kids",
-    # Music
-    "music": "Music", "mtv": "Music", "vh1": "Music", "bet": "Music",
-    # Documentary
-    "discovery": "Documentary", "history": "Documentary", "nat geo": "Documentary",
-    "science": "Documentary", "animal": "Documentary", "nature": "Documentary",
-    "crime": "Documentary", "investigation": "Documentary",
-    # Entertainment
-    "comedy": "Entertainment", "reality": "Entertainment", "bravo": "Entertainment",
-    "e!": "Entertainment", "pop": "Entertainment", "tbs": "Entertainment",
-    "tnt": "Entertainment", "usa network": "Entertainment",
-    # Spanish
-    "en español": "Spanish", "telenovela": "Spanish", "novela": "Spanish",
-    "univision": "Spanish", "telemundo": "Spanish", "galavision": "Spanish",
-    "estrella": "Spanish", "unimas": "Spanish",
-}
-
-
-# ── Helpers: country & category ───────────────────────────────────────────────
-
-def normalize_category(raw: str, channel_name: str = "", tvg_id: str = "") -> str:
-    raw_lower  = raw.strip().lower()
-    name_lower = channel_name.strip().lower()
-
-    # Treat channels with Pluto markers or no category as Pluto TV
-    is_pluto = "plutotv" in tvg_id.lower() or "pluto" in tvg_id.lower()
-    if is_pluto or not raw_lower or raw_lower in ("pluto tv", "plutotv", "pluto"):
-        for keyword, category in PLUTO_CATEGORY_MAP.items():
-            if keyword in name_lower:
-                return category
-        return "Pluto TV"
-
-    if any(x in raw_lower for x in ["sport", "deport", "futbol", "football", "soccer", "baseball", "nba", "nfl", "nhl"]):
-        return "Sports"
-    if any(x in raw_lower for x in ["news", "noticias", "noticiero"]):
-        return "News"
-    if any(x in raw_lower for x in ["movie", "pelicula", "cine", "film"]):
-        return "Movies"
-    if any(x in raw_lower for x in ["kid", "child", "infantil", "cartoon", "animation"]):
-        return "Kids"
-    if any(x in raw_lower for x in ["music", "musica"]):
-        return "Music"
-    if any(x in raw_lower for x in ["religious", "religion", "religioso", "faith", "christian", "gospel"]):
-        return "Religious"
-    if any(x in raw_lower for x in ["entertain", "entretenimiento", "variety"]):
-        return "Entertainment"
-    if "general" in raw_lower:
-        return "General"
-    if any(x in raw_lower for x in ["cultur", "document", "documental", "history"]):
-        return "Documentary"
-
-    return raw.strip().title() if raw.strip() else "General"
-
 
 def extract_country_from_tvgid(tvg_id: str) -> str:
+    """
+    Extrae el país a partir de tvg-id como:
+    - Telemundo.us
+    - CanalX.do@SD
+    """
     m = re.search(r"\.([a-z]{2})(?:@|$)", tvg_id.lower())
     if m:
         code = m.group(1)
         return COUNTRY_MAP.get(code, code.upper())
-    return "International"
+    return "Otros"
 
 
-def make_group(country: str, category: str) -> str:
-    return f"{country} | {category}"
-
-
-# ── 1. Scrape TheTVApp channel list ──────────────────────────────────────────
+# ───────────────────────────────────────────────────────────────────────────────
+# 1. Scrape de canales TheTVApp con grupos "1 TVApp ..."
+# ───────────────────────────────────────────────────────────────────────────────
 
 def fetch_channels() -> list[dict]:
+    """Obtiene la lista de canales de TheTVApp."""
     resp = requests.get(BASE_URL, headers=HEADERS, timeout=15)
     resp.raise_for_status()
     soup = BeautifulSoup(resp.text, "html.parser")
     entries, seen = [], set()
 
+    # Canales regulares (entretenimiento / live TV)
     for a in soup.find_all("a", href=re.compile(r"^/tv/[^/]+-live-stream/")):
         href = a["href"]
         if href in seen:
@@ -181,12 +135,14 @@ def fetch_channels() -> list[dict]:
             "name": name,
             "url":  BASE_URL + href,
             "slug": slug,
-            "group": "USA | Live TV",
+            # Prefijo "1" para que salgan primero en los players
+            "group": "1 TVApp Entretenimiento",
             "logo": "",
             "tvg_id": "",
             "custom": False,
         })
 
+    # Eventos / deportes
     for a in soup.find_all("a", href=re.compile(r"^/event/")):
         href = a["href"]
         if href in seen:
@@ -199,7 +155,7 @@ def fetch_channels() -> list[dict]:
             "name": name,
             "url":  BASE_URL + href,
             "slug": slug,
-            "group": "USA | Sports",
+            "group": "1 TVApp Deportes",
             "logo": "",
             "tvg_id": "",
             "custom": False,
@@ -208,50 +164,26 @@ def fetch_channels() -> list[dict]:
     return entries
 
 
-def trigger_jellyfin_refresh():
-    """Trigger Jellyfin 'Refresh Guide' scheduled task if configured."""
-    jf_url    = JELLYFIN["url"].rstrip("/")
-    api_key   = JELLYFIN["api_key"]
-    task_id   = JELLYFIN["task_id"]
-
-    if not (jf_url and api_key and task_id):
-        return
-
-    try:
-        endpoint = f"{jf_url}/ScheduledTasks/{task_id}/Trigger"
-        resp = requests.post(
-            endpoint,
-            headers={"X-Emby-Token": api_key},
-            timeout=10,
-        )
-        if resp.status_code == 204 or resp.status_code == 200:
-            print(f"[JF] Triggered Jellyfin guide refresh ({endpoint})")
-        else:
-            print(f"[JF] Refresh request returned {resp.status_code}: {resp.text[:200]}")
-    except Exception as e:
-        print(f"[JF] Failed to trigger Jellyfin refresh: {e}")
-
-
 def refresh_channels():
+    """Refresca periódicamente la lista de canales de TheTVApp."""
     global CHANNELS
     try:
-        print(f"\n[↻] Refreshing at {datetime.now().strftime('%H:%M:%S')} ...")
+        print(f"\n[↻] Refreshing TVApp at {datetime.now().strftime('%H:%M:%S')} ...")
         new_channels = fetch_channels()
         new_slugs = {ch["slug"] for ch in new_channels}
+        # Limpia tokens de canales que ya no existen
         for s in [s for s in list(TOKEN_CACHE.keys()) if s not in new_slugs]:
             del TOKEN_CACHE[s]
         CHANNELS = new_channels
         LAST_REFRESH["time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         LAST_REFRESH["next"] = f"in {REFRESH_EVERY} min"
-        print(f"[+] {len(CHANNELS)} TheTVApp channels. Next refresh {LAST_REFRESH['next']}.")
-
-        # After proxy refreshes, ask Jellyfin to refresh guide (and channels)
-        trigger_jellyfin_refresh()
+        print(f"[+] {len(CHANNELS)} TVApp channels. Next refresh {LAST_REFRESH['next']}.")
     except Exception as e:
         print(f"[!] Refresh failed: {e}")
 
 
 def start_refresh_timer():
+    """Hilo en background que refresca cada REFRESH_EVERY minutos."""
     def loop():
         while True:
             time.sleep(REFRESH_EVERY * 60)
@@ -259,9 +191,12 @@ def start_refresh_timer():
     threading.Thread(target=loop, daemon=True).start()
 
 
-# ── 2. Parse custom .m3u (handles #EXTVLCOPT, country + Pluto TV detection) ──
+# ───────────────────────────────────────────────────────────────────────────────
+# 2. Parse de m3u custom (grupos = sólo país)
+# ───────────────────────────────────────────────────────────────────────────────
 
 def parse_custom_m3u(filepath: str) -> list[dict]:
+    """Lee my_channels.m3u y agrupa canales solo por país."""
     path = Path(filepath)
     if not path.exists():
         print(f"[!] Custom file not found: {filepath}")
@@ -283,13 +218,10 @@ def parse_custom_m3u(filepath: str) -> list[dict]:
             logo_match  = re.search(r'tvg-logo="([^"]*)"', line)
             logo        = logo_match.group(1) if logo_match else ""
 
-            group_match = re.search(r'group-title="([^"]*)"', line)
-            raw_group   = group_match.group(1).split(";")[0].strip() if group_match else ""
+            # País a partir de tvg-id
+            country = extract_country_from_tvgid(tvg_id) if tvg_id else "Otros"
 
-            country  = extract_country_from_tvgid(tvg_id) if tvg_id else "International"
-            category = normalize_category(raw_group, channel_name=name, tvg_id=tvg_id)
-            group    = make_group(country, category)
-
+            # Saltar líneas #EXTXXXX hasta encontrar la URL
             i += 1
             stream_url = None
             while i < len(lines):
@@ -317,7 +249,7 @@ def parse_custom_m3u(filepath: str) -> list[dict]:
                     "name": name,
                     "url": stream_url,
                     "slug": f"custom-{slug}",
-                    "group": group,
+                    "group": country,   # <── SOLO PAÍS
                     "logo": logo,
                     "tvg_id": tvg_id,
                     "custom": True,
@@ -326,16 +258,19 @@ def parse_custom_m3u(filepath: str) -> list[dict]:
         i += 1
 
     groups = Counter(e["group"] for e in entries)
-    print("\n[Groups detected in custom playlist]")
+    print("\n[Custom playlist groups (by country)]")
     for grp, count in sorted(groups.items()):
         print(f"  {grp}: {count} channels")
 
     return entries
 
 
-# ── 3. Playwright token fetch ─────────────────────────────────────────────────
+# ───────────────────────────────────────────────────────────────────────────────
+# 3. Playwright para obtener tokens .m3u8 de TheTVApp
+# ───────────────────────────────────────────────────────────────────────────────
 
 async def _get_stream_url(page_url: str) -> str | None:
+    """Usa Playwright + Chromium para capturar el primer .m3u8 de la página."""
     from playwright.async_api import async_playwright
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
@@ -363,6 +298,7 @@ async def _get_stream_url(page_url: str) -> str | None:
 
 
 def get_stream_url(page_url: str, slug: str) -> str | None:
+    """Cachea cada token de stream durante CACHE_TTL segundos."""
     cached_url, cached_at = TOKEN_CACHE.get(slug, (None, 0))
     if cached_url and (time.time() - cached_at) < CACHE_TTL:
         return cached_url
@@ -372,7 +308,9 @@ def get_stream_url(page_url: str, slug: str) -> str | None:
     return url
 
 
-# ── 4. HTML Template (unchanged behaviour) ────────────────────────────────────
+# ───────────────────────────────────────────────────────────────────────────────
+# 4. HTML simple (opcional para ver lista en navegador)
+# ───────────────────────────────────────────────────────────────────────────────
 
 HTML_TEMPLATE = """<!DOCTYPE html>
 <html>
@@ -391,10 +329,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     .meta span b{color:#eee}
     .meta a{background:#0e4d6e;color:#7dd3fc;padding:.4rem .9rem;border-radius:6px;text-decoration:none;font-weight:bold}
     .meta a:hover{background:#1a6e8e}
-    .filters{display:flex;gap:.75rem;flex-wrap:wrap;margin-bottom:1rem}
-    .filters input,.filters select{background:#1a1a2e;border:1px solid #0e4d6e;color:#eee;
-      padding:.45rem .9rem;border-radius:6px;font-size:.9rem}
-    .filters input{width:260px}
+    input{background:#1a1a2e;border:1px solid #0e4d6e;color:#eee;padding:.45rem .9rem;border-radius:6px;font-size:.9rem;width:260px;margin-bottom:1rem}
     table{width:100%;border-collapse:collapse}
     th{background:#1a1a2e;padding:.6rem 1rem;text-align:left;color:#00d4ff;font-size:.82rem;text-transform:uppercase;letter-spacing:.05em}
     td{padding:.45rem 1rem;border-bottom:1px solid #1a1a1a;font-size:.88rem}
@@ -407,33 +342,23 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   </style>
 </head>
 <body>
-  <h1>&#128250; TheTVApp Local Proxy</h1>
+  <h1>&#128250; TheTVApp Proxy</h1>
   <div class="info">
-    Playlist URL for your IPTV app (Jellyfin / TiviMate / Kodi):
+    Playlist URL (TiviMate / IPTV Smarters):
     <code>http://localhost:PORT_PLACEHOLDER/playlist.m3u</code>
   </div>
   <div class="meta">
     <span>Total: <b>COUNT_PLACEHOLDER</b></span>
-    <span>TheTVApp: <b>TVAPP_COUNT</b></span>
+    <span>TVApp: <b>TVAPP_COUNT</b></span>
     <span>Custom: <b>CUSTOM_COUNT</b></span>
     <span>Last refresh: <b>LAST_REFRESH</b></span>
     <span>Next: <b>NEXT_REFRESH</b></span>
     <a href="/refresh">&#8635; Refresh Now</a>
   </div>
-  <div class="filters">
-    <input type="text" id="search" placeholder="&#128269; Search channel name..." oninput="applyFilters()">
-    <select id="countryFilter" onchange="applyFilters()">
-      <option value="">All Countries</option>
-      COUNTRY_OPTIONS
-    </select>
-    <select id="catFilter" onchange="applyFilters()">
-      <option value="">All Categories</option>
-      CAT_OPTIONS
-    </select>
-  </div>
+  <input type="text" id="search" placeholder="Buscar canal..." oninput="applyFilters()">
   <table id="tbl">
     <thead>
-      <tr><th>#</th><th>Logo</th><th>Channel</th><th>Group</th><th>Play</th><th>URL</th></tr>
+      <tr><th>#</th><th>Logo</th><th>Canal</th><th>Grupo</th><th>Play</th><th>URL</th></tr>
     </thead>
     <tbody>
 ROWS_PLACEHOLDER
@@ -442,15 +367,9 @@ ROWS_PLACEHOLDER
   <script>
     function applyFilters(){
       var q  = document.getElementById('search').value.toLowerCase();
-      var co = document.getElementById('countryFilter').value.toLowerCase();
-      var ca = document.getElementById('catFilter').value.toLowerCase();
       document.querySelectorAll('#tbl tbody tr').forEach(function(r){
         var txt  = r.textContent.toLowerCase();
-        var grp  = (r.dataset.group||'').toLowerCase();
-        var show = (!q || txt.includes(q))
-                && (!co || grp.startsWith(co))
-                && (!ca || grp.includes('| ' + ca.toLowerCase()));
-        r.style.display = show ? '' : 'none';
+        r.style.display = (!q || txt.includes(q)) ? '' : 'none';
       });
     }
   </script>
@@ -458,18 +377,13 @@ ROWS_PLACEHOLDER
 </html>"""
 
 
-# ── 5. Flask routes ───────────────────────────────────────────────────────────
+# ───────────────────────────────────────────────────────────────────────────────
+# 5. Rutas Flask
+# ───────────────────────────────────────────────────────────────────────────────
 
 @app.route("/")
 def index():
     all_channels = CHANNELS + CUSTOM
-
-    countries  = sorted(set(ch["group"].split(" | ")[0] for ch in all_channels))
-    categories = sorted(set(ch["group"].split(" | ")[1] for ch in all_channels if " | " in ch["group"]))
-
-    country_opts = "\n".join(f'<option value="{c}">{c}</option>' for c in countries)
-    cat_opts     = "\n".join(f'<option value="{c}">{c}</option>' for c in categories)
-
     sorted_channels = sorted(all_channels, key=lambda x: (x["group"], x["name"]))
 
     rows = ""
@@ -480,7 +394,7 @@ def index():
         group       = ch.get("group", "")
 
         rows += (
-            f'<tr data-group="{group}">'
+            f'<tr>'
             f"<td>{i}</td>"
             f"<td>{logo_html}</td>"
             f"<td>{ch['name']}</td>"
@@ -499,8 +413,6 @@ def index():
         .replace("LAST_REFRESH",      LAST_REFRESH["time"] or "N/A")
         .replace("NEXT_REFRESH",      LAST_REFRESH["next"] or "N/A")
         .replace("REFRESH_SEC",       str(REFRESH_EVERY * 60))
-        .replace("COUNTRY_OPTIONS",   country_opts)
-        .replace("CAT_OPTIONS",       cat_opts)
         .replace("ROWS_PLACEHOLDER",  rows)
     )
     return Response(html, mimetype="text/html")
@@ -516,10 +428,10 @@ def playlist():
         header += f' url-tvg="{epg}" tvg-shift="-5"'
     lines = [header]
 
-    # Assign channel numbers per group: each group gets its own 100-block
+    # Asignar números de canal por grupo (bloques de 100)
     group_order = []
     for ch in all_channels:
-        grp = ch.get("group", "General")
+        grp = ch.get("group", "Otros")
         if grp not in group_order:
             group_order.append(grp)
 
@@ -527,7 +439,7 @@ def playlist():
     counters   = {grp: 0 for grp in group_order}
 
     for ch in all_channels:
-        group     = ch.get("group", "General")
+        group     = ch.get("group", "Otros")
         base      = group_base[group]
         counters[group] += 1
         chno      = base + counters[group]
@@ -571,35 +483,30 @@ def manual_refresh():
     return redirect("/")
 
 
-# ── 6. Entry point ────────────────────────────────────────────────────────────
+# ───────────────────────────────────────────────────────────────────────────────
+# 6. main()
+# ───────────────────────────────────────────────────────────────────────────────
 
 def main():
-    ap = argparse.ArgumentParser(description="TheTVApp Local Proxy Server")
-    ap.add_argument("--port",    type=int, default=8087, help="Proxy port (default 8087)")
-    ap.add_argument("--custom",  default="", help="Path to custom .m3u file")
-    ap.add_argument("--refresh", type=int, default=30, help="Channel list refresh interval in minutes")
-    ap.add_argument("--epg",     default="", help="EPG XMLTV URL")
-    ap.add_argument("--jf-url",      default="", help="Jellyfin base URL (e.g. http://localhost:8096)")
-    ap.add_argument("--jf-api-key",  default="", help="Jellyfin API key with admin rights")
-    ap.add_argument("--jf-task-id",  default="", help="Jellyfin 'Refresh Guide' scheduled task ID")
+    import argparse
+
+    ap = argparse.ArgumentParser(description="TheTVApp Local/Remote Proxy Server")
+    ap.add_argument("--custom",  default="", help="Ruta al archivo .m3u custom (ej. my_channels.m3u)")
+    ap.add_argument("--refresh", type=int, default=30, help="Minutos entre refrescos de canales TVApp")
+    ap.add_argument("--epg",     default="", help="URL XMLTV de EPG (opcional)")
     args = ap.parse_args()
 
     CUSTOM_FILE["path"] = args.custom
     EPG_URL["url"]      = args.epg
 
-    JELLYFIN["url"]     = args.jf_url
-    JELLYFIN["api_key"] = args.jf_api_key
-    JELLYFIN["task_id"] = args.jf_task_id
-
-    global PORT, REFRESH_EVERY, CHANNELS, CUSTOM
-    PORT          = args.port
+    global REFRESH_EVERY, CHANNELS, CUSTOM
     REFRESH_EVERY = args.refresh
 
-    print("[*] Fetching channel list from thetvapp.to ...")
+    print("[*] Fetching TVApp channel list ...")
     CHANNELS = fetch_channels()
     LAST_REFRESH["time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     LAST_REFRESH["next"] = f"in {REFRESH_EVERY} min"
-    print(f"[+] {len(CHANNELS)} TheTVApp channels loaded.")
+    print(f"[+] {len(CHANNELS)} TVApp channels loaded.")
 
     if args.custom:
         CUSTOM = parse_custom_m3u(args.custom)
@@ -607,9 +514,6 @@ def main():
 
     if args.epg:
         print(f"[+] EPG source: {args.epg}")
-
-    if JELLYFIN["url"]:
-        print(f"[+] Jellyfin auto-refresh enabled for {JELLYFIN['url']}")
 
     print(f"\n[OK] Total channels : {len(CHANNELS) + len(CUSTOM)}")
     print(f"[OK] Auto-refresh   : every {REFRESH_EVERY} minutes")

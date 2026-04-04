@@ -1,4 +1,9 @@
+# Web framework
 flask
+
+# HTTP + HTML parsing
 requests
 beautifulsoup4
+
+# Playwright for grabbing tokenized .m3u8 URLs
 playwright
