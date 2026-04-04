@@ -182,8 +182,8 @@ def fetch_channels() -> list[dict]:
             "name": name,
             "url":  BASE_URL + href,
             "slug": slug,
-            # Antes: "USA | Live TV"
-            "group": "TVApp | Entretenimiento",
+            # CAMBIO: grupo fijo "1 tv app entretenimiento"
+            "group": "1 tv app entretenimiento",
             "logo": "",
             "tvg_id": "",
             "custom": False,
@@ -202,8 +202,8 @@ def fetch_channels() -> list[dict]:
             "name": name,
             "url":  BASE_URL + href,
             "slug": slug,
-            # Antes: "USA | Sports"
-            "group": "TVApp | Deportes",
+            # CAMBIO: grupo fijo "2 tv app deportes"
+            "group": "2 tv app deportes",
             "logo": "",
             "tvg_id": "",
             "custom": False,
@@ -292,7 +292,8 @@ def parse_custom_m3u(filepath: str) -> list[dict]:
 
             country  = extract_country_from_tvgid(tvg_id) if tvg_id else "International"
             category = normalize_category(raw_group, channel_name=name, tvg_id=tvg_id)
-            group    = make_group(country, category)
+            # CAMBIO: agrupar solo por país (sin categoría)
+            group    = country
 
             i += 1
             stream_url = None
@@ -395,6 +396,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     .meta span b{color:#eee}
     .meta a{background:#0e4d6e;color:#7dd3fc;padding:.4rem .9rem;border-radius:6px;text-decoration:none;font-weight:bold}
     .meta a:hover{background:#1a6e8e}
+    hr{display:block;height:1px;border:0;border-top:1px solid #1a1a2e;margin:1em 0;padding:0}
+    .error-details{margin-top:0.5em;max-width:600px}
     .filters{display:flex;gap:.75rem;flex-wrap:wrap;margin-bottom:1rem}
     .filters input,.filters select{background:#1a1a2e;border:1px solid #0e4d6e;color:#eee;
       padding:.45rem .9rem;border-radius:6px;font-size:.9rem}
@@ -414,7 +417,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   <h1>&#128250; TheTVApp Local Proxy</h1>
   <div class="info">
     Playlist URL for your IPTV app (Jellyfin / TiviMate / Kodi):
-    <code>http://localhost:PORT_PLACEHOLDER/playlist.m3u</code>
+    de>http://localhost:PORT_PLACEHOLDER/playlist.m3u</code>
   </div>
   <div class="meta">
     <span>Total: <b>COUNT_PLACEHOLDER</b></span>
@@ -490,7 +493,7 @@ def index():
             f"<td>{ch['name']}</td>"
             f"<td><span class='grp'>{group}</span></td>"
             f"<td><a class='play' href='{stream_link}' target='_blank'>&#9654; Play</a></td>"
-            f"<td><code>{stream_link}</code></td>"
+            f"<td>de>{stream_link}</code></td>"
             f"</tr>\n"
         )
 
