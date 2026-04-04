@@ -343,7 +343,7 @@ async def _get_stream_url(page_url: str) -> str | None:
     except Exception as e:
         print(f"[!] HTML scrape failed: {e}")
 
-    # Fallback a Playwright si está disponible
+    # Fallback a Playwright si está disponble
     try:
         from playwright.async_api import async_playwright
         async with async_playwright() as p:
