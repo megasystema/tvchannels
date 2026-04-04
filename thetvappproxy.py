@@ -4,15 +4,15 @@ TheTVApp Local Proxy Server  (country + category organized + Jellyfin helpers)
 ───────────────────────────────────────────────────────────────────────────────
 - Organizes channels as "Country | Category" groups
 - Assigns channel numbers (tvg-chno) by group for Jellyfin navigation
-- Serves playlist dynamically based on host url
+- Serves playlist dynamically based on host
 - Auto-refreshes channel list every N minutes (default 10)
-- Scrapes main channels, events, and specific sports categories
+- Scrapes specific sports sub-categories
 - Merges custom .m3u file via --custom
 - Optional EPG via --epg
 - Optional Jellyfin auto-refresh via --jf-url / --jf-api-key / --jf-task-id
 """
 
-import re, time, argparse, threading
+import asyncio, re, time, argparse, threading
 from pathlib import Path
 from datetime import datetime
 from collections import Counter
@@ -21,7 +21,6 @@ import os
 import requests
 from bs4 import BeautifulSoup
 from flask import Flask, Response, redirect, request
-from playwright.sync_api import sync_playwright
 
 HEADERS = {
     "User-Agent": (
@@ -34,7 +33,7 @@ HEADERS = {
 BASE_URL      = "https://thetvapp.to"
 PORT = int(os.environ.get("PORT", "8087"))
 CACHE_TTL     = 300           # token cache seconds
-REFRESH_EVERY = 10            # minutes
+REFRESH_EVERY = 10            # minutes (updated to 10 per request)
 
 app      = Flask(__name__)
 CHANNELS = []
@@ -107,6 +106,7 @@ PLUTO_CATEGORY_MAP = {
     "estrella": "Spanish", "unimas": "Spanish",
 }
 
+
 # ── Helpers: country & category ───────────────────────────────────────────────
 
 def normalize_category(raw: str, channel_name: str = "", tvg_id: str = "") -> str:
@@ -141,6 +141,7 @@ def normalize_category(raw: str, channel_name: str = "", tvg_id: str = "") -> st
 
     return raw.strip().title() if raw.strip() else "General"
 
+
 def extract_country_from_tvgid(tvg_id: str) -> str:
     m = re.search(r"\.([a-z]{2})(?:@|$)", tvg_id.lower())
     if m:
@@ -148,61 +149,87 @@ def extract_country_from_tvgid(tvg_id: str) -> str:
         return COUNTRY_MAP.get(code, code.upper())
     return "International"
 
+
+def make_group(country: str, category: str) -> str:
+    return f"{country} | {category}"
+
+
 # ── 1. Scrape TheTVApp channel list ──────────────────────────────────────────
 
 def fetch_channels() -> list[dict]:
     entries, seen = [], set()
 
-    # 1. Scrape Main Page
     try:
         resp = requests.get(BASE_URL, headers=HEADERS, timeout=15)
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, "html.parser")
 
+        # Canales regulares de TheTVApp (entretenimiento / live TV)
         for a in soup.find_all("a", href=re.compile(r"^/tv/[^/]+-live-stream/")):
             href = a["href"]
-            if href in seen: continue
+            if href in seen:
+                continue
             seen.add(href)
             raw  = a.get_text(" ", strip=True)
             name = re.sub(r"^\d+\s*\.\s*", "", raw).strip() or href.split("/")[2]
+            slug = href.strip("/").split("/")[-1]
             entries.append({
-                "name": name, "url": BASE_URL + href, "slug": href.strip("/").split("/")[-1],
-                "group": "1 tv app entretenimiento", "logo": "", "tvg_id": "", "custom": False,
+                "name": name,
+                "url":  BASE_URL + href,
+                "slug": slug,
+                "group": "1 tv app entretenimiento",
+                "logo": "",
+                "tvg_id": "",
+                "custom": False,
             })
 
+        # Eventos / deportes de TheTVApp
         for a in soup.find_all("a", href=re.compile(r"^/event/")):
             href = a["href"]
-            if href in seen: continue
+            if href in seen:
+                continue
             seen.add(href)
             raw  = a.get_text(" ", strip=True)
             name = re.sub(r"^\d+\s*\.\s*", "", raw).strip() or href.split("/")[2]
+            slug = href.strip("/").split("/")[-1]
             entries.append({
-                "name": name, "url": BASE_URL + href, "slug": href.strip("/").split("/")[-1],
-                "group": "2 tv app deportes", "logo": "", "tvg_id": "", "custom": False,
+                "name": name,
+                "url":  BASE_URL + href,
+                "slug": slug,
+                "group": "2 tv app deportes",
+                "logo": "",
+                "tvg_id": "",
+                "custom": False,
             })
     except Exception as e:
         print(f"[!] Error fetching main page: {e}")
 
-    # 2. Scrape Specific Sports Sub-Categories
+    # Scrape Specific Sports Sub-Categories
     for sport_name, sport_path in SPORTS_CATEGORIES.items():
         try:
-            resp = requests.get(BASE_URL + sport_path, headers=HEADERS, timeout=15)
-            if resp.status_code != 200: continue
-            soup = BeautifulSoup(resp.text, "html.parser")
+            target_url = BASE_URL + sport_path
+            resp = requests.get(target_url, headers=HEADERS, timeout=15)
+            if resp.status_code != 200:
+                continue
             
+            soup = BeautifulSoup(resp.text, "html.parser")
             for a in soup.find_all("a", href=re.compile(r"^/(?:event|tv)/")):
                 href = a["href"]
-                if href in seen: continue
+                if href in seen:
+                    continue
                 seen.add(href)
                 raw  = a.get_text(" ", strip=True)
                 name = re.sub(r"^\d+\s*\.\s*", "", raw).strip() or href.split("/")[-1]
+                slug = href.strip("/").split("/")[-1]
                 
                 entries.append({
                     "name": f"[{sport_name}] {name}",
                     "url":  BASE_URL + href,
-                    "slug": href.strip("/").split("/")[-1],
+                    "slug": slug,
                     "group": f"2 tv app deportes | {sport_name}",
-                    "logo": "", "tvg_id": "", "custom": False,
+                    "logo": "",
+                    "tvg_id": "",
+                    "custom": False,
                 })
         except Exception as e:
             print(f"[!] Error fetching {sport_name} category: {e}")
@@ -211,14 +238,27 @@ def fetch_channels() -> list[dict]:
 
 
 def trigger_jellyfin_refresh():
-    jf_url, api_key, task_id = JELLYFIN["url"].rstrip("/"), JELLYFIN["api_key"], JELLYFIN["task_id"]
-    if not (jf_url and api_key and task_id): return
+    """Trigger Jellyfin 'Refresh Guide' scheduled task if configured."""
+    jf_url    = JELLYFIN["url"].rstrip("/")
+    api_key   = JELLYFIN["api_key"]
+    task_id   = JELLYFIN["task_id"]
+
+    if not (jf_url and api_key and task_id):
+        return
+
     try:
         endpoint = f"{jf_url}/ScheduledTasks/{task_id}/Trigger"
-        resp = requests.post(endpoint, headers={"X-Emby-Token": api_key}, timeout=10)
-        print(f"[JF] Triggered Jellyfin guide refresh" if resp.status_code in (200, 204) else f"[JF] Error {resp.status_code}")
+        resp = requests.post(
+            endpoint,
+            headers={"X-Emby-Token": api_key},
+            timeout=10,
+        )
+        if resp.status_code == 204 or resp.status_code == 200:
+            print(f"[JF] Triggered Jellyfin guide refresh ({endpoint})")
+        else:
+            print(f"[JF] Refresh request returned {resp.status_code}: {resp.text[:200]}")
     except Exception as e:
-        print(f"[JF] Failed: {e}")
+        print(f"[JF] Failed to trigger Jellyfin refresh: {e}")
 
 
 def refresh_channels():
@@ -233,6 +273,8 @@ def refresh_channels():
         LAST_REFRESH["time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         LAST_REFRESH["next"] = f"in {REFRESH_EVERY} min"
         print(f"[+] {len(CHANNELS)} TheTVApp channels. Next refresh {LAST_REFRESH['next']}.")
+
+        # After proxy refreshes, ask Jellyfin to refresh guide (and channels)
         trigger_jellyfin_refresh()
     except Exception as e:
         print(f"[!] Refresh failed: {e}")
@@ -261,16 +303,22 @@ def parse_custom_m3u(filepath: str) -> list[dict]:
         line = lines[i].strip()
 
         if line.startswith("#EXTINF"):
-            name        = (re.search(r",(.+)$", line) or re.search(r"", "")).group(1).strip() if re.search(r",(.+)$", line) else "Unknown"
-            tvg_id      = (re.search(r'tvg-id="([^"]*)"', line) or re.search(r"", "")).group(1) if re.search(r'tvg-id="([^"]*)"', line) else ""
-            logo        = (re.search(r'tvg-logo="([^"]*)"', line) or re.search(r"", "")).group(1) if re.search(r'tvg-logo="([^"]*)"', line) else ""
-            raw_group   = (re.search(r'group-title="([^"]*)"', line) or re.search(r"", "")).group(1).split(";")[0].strip() if re.search(r'group-title="([^"]*)"', line) else ""
+            name_match  = re.search(r",(.+)$", line)
+            name        = name_match.group(1).strip() if name_match else "Unknown"
+
+            tvgid_match = re.search(r'tvg-id="([^"]*)"', line)
+            tvg_id      = tvgid_match.group(1) if tvgid_match else ""
+
+            logo_match  = re.search(r'tvg-logo="([^"]*)"', line)
+            logo        = logo_match.group(1) if logo_match else ""
+
+            group_match = re.search(r'group-title="([^"]*)"', line)
+            raw_group   = group_match.group(1).split(";")[0].strip() if group_match else ""
 
             country  = extract_country_from_tvgid(tvg_id) if tvg_id else "International"
             category = normalize_category(raw_group, channel_name=name, tvg_id=tvg_id)
-            
-            # RESTORED CATEGORY: Groups custom channels cleanly
-            group    = f"{country} | {category}"
+            # CAMBIO: agrupar solo por país (sin categoría)
+            group    = country
 
             i += 1
             stream_url = None
@@ -288,10 +336,22 @@ def parse_custom_m3u(filepath: str) -> list[dict]:
                 break
 
             if stream_url:
-                slug = re.sub(r"[^a-z0-9]+", "-", name.lower().replace("ñ", "n").replace("é", "e").replace("á", "a").replace("ó", "o").replace("ú", "u").replace("í", "i")).strip("-")
+                slug = re.sub(
+                    r"[^a-z0-9]+",
+                    "-",
+                    name.lower()
+                        .replace("ñ", "n").replace("é", "e").replace("á", "a")
+                        .replace("ó", "o").replace("ú", "u").replace("í", "i"),
+                ).strip("-")
                 entries.append({
-                    "name": name, "url": stream_url, "slug": f"custom-{slug}",
-                    "group": group, "logo": logo, "tvg_id": tvg_id, "custom": True, "stream_url": stream_url,
+                    "name": name,
+                    "url": stream_url,
+                    "slug": f"custom-{slug}",
+                    "group": group,
+                    "logo": logo,
+                    "tvg_id": tvg_id,
+                    "custom": True,
+                    "stream_url": stream_url,
                 })
         i += 1
 
@@ -303,47 +363,46 @@ def parse_custom_m3u(filepath: str) -> list[dict]:
     return entries
 
 
-# ── 3. Playwright token fetch (SYNC VERSION to fix Flask crash) ───────────────
+# ── 3. Playwright token fetch ─────────────────────────────────────────────────
+
+async def _get_stream_url(page_url: str) -> str | None:
+    from playwright.async_api import async_playwright
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        ctx  = await browser.new_context(user_agent=HEADERS["User-Agent"])
+        page = await ctx.new_page()
+        found: list[str] = []
+
+        async def intercept(req):
+            if ".m3u8" in req.url and not found:
+                found.append(req.url)
+
+        page.on("request", intercept)
+
+        try:
+            await page.goto(page_url, wait_until="networkidle", timeout=20_000)
+            deadline = time.time() + 10
+            while not found and time.time() < deadline:
+                await asyncio.sleep(0.3)
+        except Exception:
+            pass
+        finally:
+            await browser.close()
+
+    return found[0] if found else None
+
 
 def get_stream_url(page_url: str, slug: str) -> str | None:
     cached_url, cached_at = TOKEN_CACHE.get(slug, (None, 0))
     if cached_url and (time.time() - cached_at) < CACHE_TTL:
         return cached_url
-
-    url = None
-    try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            ctx  = browser.new_context(user_agent=HEADERS["User-Agent"])
-            page = ctx.new_page()
-            found: list[str] = []
-
-            def intercept(req):
-                if ".m3u8" in req.url and not found:
-                    found.append(req.url)
-
-            page.on("request", intercept)
-
-            try:
-                page.goto(page_url, wait_until="networkidle", timeout=20_000)
-                deadline = time.time() + 10
-                while not found and time.time() < deadline:
-                    page.wait_for_timeout(300)
-            except Exception:
-                pass
-            finally:
-                browser.close()
-
-            url = found[0] if found else None
-    except Exception as e:
-        print(f"[!] Playwright extraction error: {e}")
-
+    url = asyncio.run(_get_stream_url(page_url))
     if url:
         TOKEN_CACHE[slug] = (url, time.time())
     return url
 
 
-# ── 4. HTML Template ──────────────────────────────────────────────────────────
+# ── 4. HTML Template (unchanged behaviour) ────────────────────────────────────
 
 HTML_TEMPLATE = """<!DOCTYPE html>
 <html>
@@ -363,6 +422,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     .meta a{background:#0e4d6e;color:#7dd3fc;padding:.4rem .9rem;border-radius:6px;text-decoration:none;font-weight:bold}
     .meta a:hover{background:#1a6e8e}
     hr{display:block;height:1px;border:0;border-top:1px solid #1a1a2e;margin:1em 0;padding:0}
+    .error-details{margin-top:0.5em;max-width:600px}
     .filters{display:flex;gap:.75rem;flex-wrap:wrap;margin-bottom:1rem}
     .filters input,.filters select{background:#1a1a2e;border:1px solid #0e4d6e;color:#eee;
       padding:.45rem .9rem;border-radius:6px;font-size:.9rem}
@@ -429,6 +489,7 @@ ROWS_PLACEHOLDER
 </body>
 </html>"""
 
+
 # ── 5. Flask routes ───────────────────────────────────────────────────────────
 
 @app.route("/")
@@ -446,7 +507,7 @@ def index():
 
     rows = ""
     for i, ch in enumerate(sorted_channels, 1):
-        stream_link = ch["stream_url"] if ch.get("custom") else f"/stream/{ch['slug']}"
+        stream_link = ch["stream_url"] if ch.get("custom") else f"{host_url}/stream/{ch['slug']}"
         logo        = ch.get("logo", "")
         logo_html   = f'<img class="logo" src="{logo}" alt="" loading="lazy">' if logo else ""
         group       = ch.get("group", "")
@@ -489,6 +550,7 @@ def playlist():
         header += f' url-tvg="{epg}" tvg-shift="-5"'
     lines = [header]
 
+    # Assign channel numbers per group: each group gets its own 100-block
     group_order = []
     for ch in all_channels:
         grp = ch.get("group", "General")
@@ -500,10 +562,10 @@ def playlist():
 
     for ch in all_channels:
         group     = ch.get("group", "General")
+        base      = group_base[group]
         counters[group] += 1
-        chno      = group_base[group] + counters[group]
+        chno      = base + counters[group]
 
-        # Use absolute host dynamically here for IPTV players
         stream_url = ch["stream_url"] if ch.get("custom") else f"{host_url}/stream/{ch['slug']}"
         tvg_id     = ch.get("tvg_id", "")
         logo       = ch.get("logo", "")
@@ -533,9 +595,6 @@ def stream(slug):
         return "Stream unavailable", 503
     return redirect(url)
 
-@app.route("/favicon.ico")
-def favicon():
-    return "", 204
 
 @app.route("/refresh")
 def manual_refresh():
@@ -579,6 +638,12 @@ def main():
     if args.custom:
         CUSTOM = parse_custom_m3u(args.custom)
         print(f"[+] {len(CUSTOM)} custom channels loaded from {args.custom}")
+
+    if args.epg:
+        print(f"[+] EPG source: {args.epg}")
+
+    if JELLYFIN["url"]:
+        print(f"[+] Jellyfin auto-refresh enabled for {JELLYFIN['url']}")
 
     print(f"\n[OK] Total channels : {len(CHANNELS) + len(CUSTOM)}")
     print(f"[OK] Auto-refresh   : every {REFRESH_EVERY} minutes")
