@@ -595,7 +595,9 @@ def playlist():
         counters[group] += 1
         chno   = group_base[group] + counters[group]
 
-        stream_url = ch["stream_url"] if ch.get("custom") else f"http://localhost:{PORT}/stream/{ch['slug']}"
+        from flask import request # (Make sure this is imported at the top if it isn't already)
+        host_url = request.host_url.rstrip("/")
+        stream_url = ch["stream_url"] if ch.get("custom") else f"{host_url}/stream/{ch['slug']}"
         lines.append(
             f'#EXTINF:-1 tvg-id="{ch.get("tvg_id","")}" tvg-name="{ch["name"]}" '
             f'tvg-logo="{ch.get("logo","")}" group-title="{group}" tvg-chno="{chno}",{ch["name"]}'
