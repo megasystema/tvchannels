@@ -4,9 +4,9 @@ TheTVApp Local Proxy Server  (country + category organized + Jellyfin helpers)
 ───────────────────────────────────────────────────────────────────────────────
 - Organizes channels as "Country | Category" groups
 - Assigns channel numbers (tvg-chno) by group for Jellyfin navigation
-- Serves playlist dynamically based on host
+- Serves playlist dynamically based on host url
 - Auto-refreshes channel list every N minutes (default 10)
-- Scrapes specific sports sub-categories
+- Scrapes sports as separate categories (MLB, NBA, etc.)
 - Merges custom .m3u file via --custom
 - Optional EPG via --epg
 - Optional Jellyfin auto-refresh via --jf-url / --jf-api-key / --jf-task-id
@@ -33,7 +33,7 @@ HEADERS = {
 BASE_URL      = "https://thetvapp.to"
 PORT = int(os.environ.get("PORT", "8087"))
 CACHE_TTL     = 300           # token cache seconds
-REFRESH_EVERY = 10            # minutes (updated to 10 per request)
+REFRESH_EVERY = 10            # minutes
 
 app      = Flask(__name__)
 CHANNELS = []
@@ -51,18 +51,6 @@ JELLYFIN = {
     "task_id": "",
 }
 
-# ── Sports Sub-categories to Scrape ───────────────────────────────────────────
-SPORTS_CATEGORIES = {
-    "MLB": "/mlb",
-    "NBA": "/nba",
-    "NHL": "/nhl",
-    "NFL": "/nfl",
-    "NCAAF": "/ncaaf",
-    "NCAAB": "/ncaab",
-    "Soccer": "/soccer",
-    "PPV": "/ppv"
-}
-
 # ── Country code → full name map ──────────────────────────────────────────────
 COUNTRY_MAP = {
     "us": "USA", "mx": "Mexico", "do": "Dominican Republic",
@@ -78,70 +66,6 @@ COUNTRY_MAP = {
     "international": "International",
 }
 
-# ── Pluto TV channel name → category map ─────────────────────────────────────
-PLUTO_CATEGORY_MAP = {
-    "cnn": "News", "fox news": "News", "msnbc": "News", "bloomberg": "News",
-    "nbc news": "News", "abc news": "News", "cbs news": "News",
-    "sky news": "News", "euronews": "News", "france 24": "News",
-    "al jazeera": "News", "telemundo news": "News", "univision news": "News",
-    "espn": "Sports", "nfl": "Sports", "nba": "Sports", "mlb": "Sports",
-    "nhl": "Sports", "fox sports": "Sports", "beinsports": "Sports",
-    "stadium": "Sports", "fight": "Sports", "wrestling": "Sports",
-    "motor": "Sports", "racing": "Sports",
-    "movies": "Movies", "cinema": "Movies", "film": "Movies",
-    "horror": "Movies", "comedy movies": "Movies", "action movies": "Movies",
-    "thriller": "Movies", "drama movies": "Movies", "hallmark": "Movies",
-    "lifetime": "Movies", "amc": "Movies", "tcm": "Movies",
-    "nickelodeon": "Kids", "cartoon": "Kids", "disney": "Kids",
-    "nick jr": "Kids", "baby": "Kids", "kid": "Kids",
-    "music": "Music", "mtv": "Music", "vh1": "Music", "bet": "Music",
-    "discovery": "Documentary", "history": "Documentary", "nat geo": "Documentary",
-    "science": "Documentary", "animal": "Documentary", "nature": "Documentary",
-    "crime": "Documentary", "investigation": "Documentary",
-    "comedy": "Entertainment", "reality": "Entertainment", "bravo": "Entertainment",
-    "e!": "Entertainment", "pop": "Entertainment", "tbs": "Entertainment",
-    "tnt": "Entertainment", "usa network": "Entertainment",
-    "en español": "Spanish", "telenovela": "Spanish", "novela": "Spanish",
-    "univision": "Spanish", "telemundo": "Spanish", "galavision": "Spanish",
-    "estrella": "Spanish", "unimas": "Spanish",
-}
-
-
-# ── Helpers: country & category ───────────────────────────────────────────────
-
-def normalize_category(raw: str, channel_name: str = "", tvg_id: str = "") -> str:
-    raw_lower  = raw.strip().lower()
-    name_lower = channel_name.strip().lower()
-
-    is_pluto = "plutotv" in tvg_id.lower() or "pluto" in tvg_id.lower()
-    if is_pluto or not raw_lower or raw_lower in ("pluto tv", "plutotv", "pluto"):
-        for keyword, category in PLUTO_CATEGORY_MAP.items():
-            if keyword in name_lower:
-                return category
-        return "Pluto TV"
-
-    if any(x in raw_lower for x in ["sport", "deport", "futbol", "football", "soccer", "baseball", "nba", "nfl", "nhl"]):
-        return "Sports"
-    if any(x in raw_lower for x in ["news", "noticias", "noticiero"]):
-        return "News"
-    if any(x in raw_lower for x in ["movie", "pelicula", "cine", "film"]):
-        return "Movies"
-    if any(x in raw_lower for x in ["kid", "child", "infantil", "cartoon", "animation"]):
-        return "Kids"
-    if any(x in raw_lower for x in ["music", "musica"]):
-        return "Music"
-    if any(x in raw_lower for x in ["religious", "religion", "religioso", "faith", "christian", "gospel"]):
-        return "Religious"
-    if any(x in raw_lower for x in ["entertain", "entretenimiento", "variety"]):
-        return "Entertainment"
-    if "general" in raw_lower:
-        return "General"
-    if any(x in raw_lower for x in ["cultur", "document", "documental", "history"]):
-        return "Documentary"
-
-    return raw.strip().title() if raw.strip() else "General"
-
-
 def extract_country_from_tvgid(tvg_id: str) -> str:
     m = re.search(r"\.([a-z]{2})(?:@|$)", tvg_id.lower())
     if m:
@@ -149,22 +73,17 @@ def extract_country_from_tvgid(tvg_id: str) -> str:
         return COUNTRY_MAP.get(code, code.upper())
     return "International"
 
-
-def make_group(country: str, category: str) -> str:
-    return f"{country} | {category}"
-
-
 # ── 1. Scrape TheTVApp channel list ──────────────────────────────────────────
 
 def fetch_channels() -> list[dict]:
     entries, seen = [], set()
 
+    # 1. Grab main live TV channels
     try:
         resp = requests.get(BASE_URL, headers=HEADERS, timeout=15)
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, "html.parser")
 
-        # Canales regulares de TheTVApp (entretenimiento / live TV)
         for a in soup.find_all("a", href=re.compile(r"^/tv/[^/]+-live-stream/")):
             href = a["href"]
             if href in seen:
@@ -183,7 +102,7 @@ def fetch_channels() -> list[dict]:
                 "custom": False,
             })
 
-        # Eventos / deportes de TheTVApp
+        # Grab General Events from main page
         for a in soup.find_all("a", href=re.compile(r"^/event/")):
             href = a["href"]
             if href in seen:
@@ -204,41 +123,49 @@ def fetch_channels() -> list[dict]:
     except Exception as e:
         print(f"[!] Error fetching main page: {e}")
 
-    # Scrape Specific Sports Sub-Categories
-    for sport_name, sport_path in SPORTS_CATEGORIES.items():
+    # 2. Grab Sports as SEPARATE categories
+    sports_urls = {
+        "MLB": "/mlb",
+        "NBA": "/nba",
+        "NHL": "/nhl",
+        "NFL": "/nfl",
+        "NCAAF": "/ncaaf",
+        "NCAAB": "/ncaab",
+        "Soccer": "/soccer",
+        "PPV": "/ppv"
+    }
+
+    for sport_name, sport_path in sports_urls.items():
         try:
             target_url = BASE_URL + sport_path
-            resp = requests.get(target_url, headers=HEADERS, timeout=15)
-            if resp.status_code != 200:
-                continue
-            
-            soup = BeautifulSoup(resp.text, "html.parser")
-            for a in soup.find_all("a", href=re.compile(r"^/(?:event|tv)/")):
-                href = a["href"]
-                if href in seen:
-                    continue
-                seen.add(href)
-                raw  = a.get_text(" ", strip=True)
-                name = re.sub(r"^\d+\s*\.\s*", "", raw).strip() or href.split("/")[-1]
-                slug = href.strip("/").split("/")[-1]
-                
-                entries.append({
-                    "name": f"[{sport_name}] {name}",
-                    "url":  BASE_URL + href,
-                    "slug": slug,
-                    "group": f"2 tv app deportes | {sport_name}",
-                    "logo": "",
-                    "tvg_id": "",
-                    "custom": False,
-                })
+            s_resp = requests.get(target_url, headers=HEADERS, timeout=15)
+            if s_resp.status_code == 200:
+                s_soup = BeautifulSoup(s_resp.text, "html.parser")
+                for a in s_soup.find_all("a", href=re.compile(r"^/(?:event|tv)/")):
+                    href = a["href"]
+                    if href in seen:
+                        continue
+                    seen.add(href)
+                    raw  = a.get_text(" ", strip=True)
+                    name = re.sub(r"^\d+\s*\.\s*", "", raw).strip() or href.split("/")[-1]
+                    slug = href.strip("/").split("/")[-1]
+                    
+                    entries.append({
+                        "name": name,
+                        "url":  BASE_URL + href,
+                        "slug": slug,
+                        "group": sport_name, # Separated out as requested!
+                        "logo": "",
+                        "tvg_id": "",
+                        "custom": False,
+                    })
         except Exception as e:
-            print(f"[!] Error fetching {sport_name} category: {e}")
+            print(f"[!] Error fetching {sport_name}: {e}")
 
     return entries
 
 
 def trigger_jellyfin_refresh():
-    """Trigger Jellyfin 'Refresh Guide' scheduled task if configured."""
     jf_url    = JELLYFIN["url"].rstrip("/")
     api_key   = JELLYFIN["api_key"]
     task_id   = JELLYFIN["task_id"]
@@ -274,7 +201,6 @@ def refresh_channels():
         LAST_REFRESH["next"] = f"in {REFRESH_EVERY} min"
         print(f"[+] {len(CHANNELS)} TheTVApp channels. Next refresh {LAST_REFRESH['next']}.")
 
-        # After proxy refreshes, ask Jellyfin to refresh guide (and channels)
         trigger_jellyfin_refresh()
     except Exception as e:
         print(f"[!] Refresh failed: {e}")
@@ -288,7 +214,7 @@ def start_refresh_timer():
     threading.Thread(target=loop, daemon=True).start()
 
 
-# ── 2. Parse custom .m3u (handles #EXTVLCOPT, country + Pluto TV detection) ──
+# ── 2. Parse custom .m3u ──────────────────────────────────────────────────────
 
 def parse_custom_m3u(filepath: str) -> list[dict]:
     path = Path(filepath)
@@ -312,13 +238,8 @@ def parse_custom_m3u(filepath: str) -> list[dict]:
             logo_match  = re.search(r'tvg-logo="([^"]*)"', line)
             logo        = logo_match.group(1) if logo_match else ""
 
-            group_match = re.search(r'group-title="([^"]*)"', line)
-            raw_group   = group_match.group(1).split(";")[0].strip() if group_match else ""
-
             country  = extract_country_from_tvgid(tvg_id) if tvg_id else "International"
-            category = normalize_category(raw_group, channel_name=name, tvg_id=tvg_id)
-            # CAMBIO: agrupar solo por país (sin categoría)
-            group    = country
+            group    = country # Group ONLY by country
 
             i += 1
             stream_url = None
@@ -363,7 +284,7 @@ def parse_custom_m3u(filepath: str) -> list[dict]:
     return entries
 
 
-# ── 3. Playwright token fetch ─────────────────────────────────────────────────
+# ── 3. Playwright token fetch (YOUR ORIGINAL ASYNC CODE) ──────────────────────
 
 async def _get_stream_url(page_url: str) -> str | None:
     from playwright.async_api import async_playwright
@@ -402,7 +323,7 @@ def get_stream_url(page_url: str, slug: str) -> str | None:
     return url
 
 
-# ── 4. HTML Template (unchanged behaviour) ────────────────────────────────────
+# ── 4. HTML Template ──────────────────────────────────────────────────────────
 
 HTML_TEMPLATE = """<!DOCTYPE html>
 <html>
@@ -422,7 +343,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     .meta a{background:#0e4d6e;color:#7dd3fc;padding:.4rem .9rem;border-radius:6px;text-decoration:none;font-weight:bold}
     .meta a:hover{background:#1a6e8e}
     hr{display:block;height:1px;border:0;border-top:1px solid #1a1a2e;margin:1em 0;padding:0}
-    .error-details{margin-top:0.5em;max-width:600px}
     .filters{display:flex;gap:.75rem;flex-wrap:wrap;margin-bottom:1rem}
     .filters input,.filters select{background:#1a1a2e;border:1px solid #0e4d6e;color:#eee;
       padding:.45rem .9rem;border-radius:6px;font-size:.9rem}
@@ -455,12 +375,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   <div class="filters">
     <input type="text" id="search" placeholder="&#128269; Search channel name..." oninput="applyFilters()">
     <select id="countryFilter" onchange="applyFilters()">
-      <option value="">All Countries</option>
+      <option value="">All Groups</option>
       COUNTRY_OPTIONS
-    </select>
-    <select id="catFilter" onchange="applyFilters()">
-      <option value="">All Categories</option>
-      CAT_OPTIONS
     </select>
   </div>
   <table id="tbl">
@@ -475,13 +391,10 @@ ROWS_PLACEHOLDER
     function applyFilters(){
       var q  = document.getElementById('search').value.toLowerCase();
       var co = document.getElementById('countryFilter').value.toLowerCase();
-      var ca = document.getElementById('catFilter').value.toLowerCase();
       document.querySelectorAll('#tbl tbody tr').forEach(function(r){
         var txt  = r.textContent.toLowerCase();
         var grp  = (r.dataset.group||'').toLowerCase();
-        var show = (!q || txt.includes(q))
-                && (!co || grp.startsWith(co))
-                && (!ca || grp.includes('| ' + ca.toLowerCase()));
+        var show = (!q || txt.includes(q)) && (!co || grp === co);
         r.style.display = show ? '' : 'none';
       });
     }
@@ -497,11 +410,9 @@ def index():
     all_channels = CHANNELS + CUSTOM
     host_url = request.host_url.rstrip("/")
 
-    countries  = sorted(set(ch["group"].split(" | ")[0] for ch in all_channels))
-    categories = sorted(set(ch["group"].split(" | ")[1] for ch in all_channels if " | " in ch["group"]))
-
-    country_opts = "\n".join(f'<option value="{c}">{c}</option>' for c in countries)
-    cat_opts     = "\n".join(f'<option value="{c}">{c}</option>' for c in categories)
+    # Grab all unique groups (Countries AND Sports Categories)
+    groups = sorted(set(ch["group"] for ch in all_channels))
+    group_opts = "\n".join(f'<option value="{g}">{g}</option>' for g in groups)
 
     sorted_channels = sorted(all_channels, key=lambda x: (x["group"], x["name"]))
 
@@ -532,8 +443,7 @@ def index():
         .replace("LAST_REFRESH",      LAST_REFRESH["time"] or "N/A")
         .replace("NEXT_REFRESH",      LAST_REFRESH["next"] or "N/A")
         .replace("REFRESH_SEC",       str(REFRESH_EVERY * 60))
-        .replace("COUNTRY_OPTIONS",   country_opts)
-        .replace("CAT_OPTIONS",       cat_opts)
+        .replace("COUNTRY_OPTIONS",   group_opts)
         .replace("ROWS_PLACEHOLDER",  rows)
     )
     return Response(html, mimetype="text/html")
@@ -550,7 +460,6 @@ def playlist():
         header += f' url-tvg="{epg}" tvg-shift="-5"'
     lines = [header]
 
-    # Assign channel numbers per group: each group gets its own 100-block
     group_order = []
     for ch in all_channels:
         grp = ch.get("group", "General")
@@ -562,9 +471,8 @@ def playlist():
 
     for ch in all_channels:
         group     = ch.get("group", "General")
-        base      = group_base[group]
         counters[group] += 1
-        chno      = base + counters[group]
+        chno      = group_base[group] + counters[group]
 
         stream_url = ch["stream_url"] if ch.get("custom") else f"{host_url}/stream/{ch['slug']}"
         tvg_id     = ch.get("tvg_id", "")
@@ -595,6 +503,9 @@ def stream(slug):
         return "Stream unavailable", 503
     return redirect(url)
 
+@app.route("/favicon.ico")
+def favicon():
+    return "", 204
 
 @app.route("/refresh")
 def manual_refresh():
