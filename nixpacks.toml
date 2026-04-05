@@ -1,5 +1,5 @@
 [phases.setup]
 nixPkgs = ["...", "glib", "nss", "nspr", "atk", "cups", "libdrm", "gtk3", "pango", "cairo", "alsa-lib", "mesa"]
 
-[phases.build]
-cmds = ["pip install -r requirements.txt", "playwright install chromium --with-deps"]
+[start]
+cmd = "playwright install chromium && python thetvappproxy.py --custom my_channels.m3u --epg https://epg.pw/xmltv/epg.xml"
